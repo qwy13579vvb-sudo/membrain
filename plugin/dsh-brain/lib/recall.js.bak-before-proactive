@@ -1,0 +1,194 @@
+/** 插件内自带的检索：副库定位 → 图联想 → 主库取原文 → 注入 + 复习 */
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+const MG = process.env.MG_DIR
+  || '/root/Documents/deepseek-harness/default-workspace/memory-graph';
+const IDX = path.join(MG, 'index.json');
+const DB = path.join(MG, 'memory.db');
+const DAY = 86400000;
+
+let cache = { mtime: 0, data: null };
+function loadIndex() {
+  try {
+    const m = fs.statSync(IDX).mtimeMs;
+    if (m !== cache.mtime) { cache = { mtime: m, data: JSON.parse(fs.readFileSync(IDX, 'utf-8')) }; }
+    return cache.data;
+  } catch { return null; }
+}
+
+function bigrams(s) {
+  const t = String(s).replace(/[\s\p{P}]+/gu, ' ').trim();
+  const out = new Set();
+  for (const c of t.split(' ')) {
+    if (!c) continue;
+    if (c.length === 1) { out.add(c); continue; }
+    for (let i = 0; i < c.length - 1; i++) out.add(c.slice(i, i + 2));
+  }
+  return out;
+}
+
+const SH = 8 * 3600000;
+function startOfDayCN(ts) { const d = new Date(ts + SH); d.setUTCHours(0,0,0,0); return d.getTime() - SH; }
+function parseTimeRange(q, now = Date.now()) {
+  const today = startOfDayCN(now);
+  const rel = [[/今天|今日/, 0], [/昨天|昨日/, 1], [/前天/, 2], [/(\d+)\s*天前/, -1]];
+  for (const [re, off] of rel) {
+    const m = String(q).match(re);
+    if (!m) continue;
+    const n = off === -1 ? Number(m[1]) : off;
+    if (!Number.isFinite(n)) continue;
+    const s0 = today - n * 86400000;
+    return { since: s0, until: s0 + 86400000, label: n ? n + '天前' : '今天' };
+  }
+  if (/本周|这周/.test(q)) return { since: today - 6 * 86400000, until: now, label: '本周' };
+  if (/上周/.test(q)) return { since: today - 13 * 86400000, until: today - 6 * 86400000, label: '上周' };
+  return null;
+}
+
+const EMO = /[！!？?]|太|真的|居然|竟然|好|痛|怕|气|喜|哭|笑|爱|恨|难过|开心|激动/;
+
+/** 主检索：返回 {block, chars, ms, hits} */
+export function recall(query, { budget = 900, maxItems = 10 } = {}) {
+  const t0 = Date.now();
+  const idx = loadIndex();
+  const DBG = process.env.MG_DEBUG === '1';
+  if (DBG) console.error('[dbg] idx=', idx && idx.entries.length, 'query=', JSON.stringify(query));
+  if (!idx || !query) return { block: '', chars: 0, ms: Date.now() - t0, hits: 0 };
+
+  const grams = [...bigrams(query)];
+  if (!grams.length) return { block: '', chars: 0, ms: 0, hits: 0 };
+  const qa = EMO.test(query) ? 0.6 : 0.2;
+
+  const range = parseTimeRange(query);
+  const scored = [];
+  for (const e of idx.entries) {
+    if (range && (e.t < range.since || e.t > range.until)) continue;
+    let sc = 0;
+    for (const g of grams) {
+      if (e.s.includes(g)) sc += 2;
+      if (e.g.includes(g)) sc += 3;
+    }
+    if (!sc) continue;
+    const pin = e.p ? 1.6 : 1;
+    scored.push({ e, sc: sc * (0.4 + (e.w || 0)) * (1 + 0.35 * qa * (e.a || 0)) * pin });
+  }
+  if (range) {
+    const inR = idx.entries.filter((e) => e.t >= range.since && e.t <= range.until);
+    const seen = new Set(scored.map((x) => x.e.i));
+    for (const e of inR.filter((x) => !seen.has(x.i)).sort((a, b) => (b.p ? 1 : 0) - (a.p ? 1 : 0) || b.w - a.w).slice(0, 6)) {
+      scored.push({ e, sc: 0.5 + (e.w || 0) });
+    }
+  }
+  scored.sort((a, b) => b.sc - a.sc);
+  const top = scored.slice(0, maxItems).map((x) => x.e);
+  if (DBG) console.error('[dbg] scored=', scored.length, 'top=', top.length);
+  if (!top.length) return { block: '', chars: 0, ms: Date.now() - t0, hits: 0 };
+
+  let db;
+  try { db = new DatabaseSync(DB); } catch { return { block: '', chars: 0, ms: 0, hits: 0 }; }
+
+  const ids = top.map((e) => e.i);
+  // 图联想一跳
+  try {
+    const st = db.prepare(`SELECT dst AS o, weight w FROM edge WHERE src=? UNION SELECT src AS o, weight w FROM edge WHERE dst=?`);
+    const extra = new Map();
+    for (const id of ids.slice(0, 8)) for (const r of st.all(id, id)) {
+      if (!ids.includes(r.o)) extra.set(r.o, Math.max(extra.get(r.o) || 0, r.w || 0));
+    }
+    ids.push(...[...extra.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([x]) => x));
+  } catch { /* 忽略 */ }
+
+  const lines = [];
+  let chars = 0;
+  const now = Date.now();
+  for (const id of ids) {
+    let r; try { r = db.prepare(`SELECT id,kind,text,ts_from,layer,emotion,importance,strength,last_review_at FROM node WHERE id=?`).get(id); } catch { continue; }
+    if (!r) continue;
+    const d = new Date(r.ts_from);
+    const stamp = `${d.getMonth() + 1}/${d.getDate()}`;
+    const tag = r.kind === 'promise' ? '·📌承诺' : '';
+    const line = `• [${stamp}·L${r.layer}·${r.kind}${tag}] ${String(r.text || '').slice(0, 150)}`;
+    if (chars + line.length > budget) break;
+    lines.push(line);
+    chars += line.length + 1;
+    if (lines.length >= maxItems) break;
+  }
+
+  // 命中即复习（遗忘曲线）
+  try {
+    const up = db.prepare(`UPDATE node SET access_count=access_count+1, last_access=?,
+      review_count=review_count+1, last_review_at=?, strength=? WHERE id=?`);
+    for (const id of ids.slice(0, lines.length)) {
+      const r = db.prepare(`SELECT strength, last_review_at, ts_from FROM node WHERE id=?`).get(id);
+      if (!r) continue;
+      const S = Math.max(0.2, r.strength || 1);
+      const last = r.last_review_at || r.ts_from;
+      const R = Math.exp(-Math.max(0, (now - last) / DAY) / S);
+      up.run(now, now, +(S * (1 + (1 - R) * 1.4)).toFixed(3), id);
+    }
+  } catch { /* 忽略 */ }
+
+  // 认知缺口：一次也没命中 → 记下来「我不知道这个」
+  try {
+    if (!lines.length && query && query.length >= 4) {
+      const key = 'miss:' + query.slice(0, 40);
+      const dup = db.prepare(`SELECT id FROM node WHERE kind='gap' AND source_ref=?`).get(key);
+      if (dup) db.prepare(`UPDATE node SET access_count=access_count+1, last_access=? WHERE id=?`).run(Date.now(), dup.id);
+      else db.prepare(`INSERT INTO node (uid, kind, text, ts_from, ts_to, source, source_ref, speaker,
+          importance, confidence, user_confirmed, layer, emotion, arousal, strength, status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('gap-' + Date.now(), 'gap', '缺口｜库里没有：' + query.slice(0, 60),
+          Date.now(), Date.now(), 'gap', key, 'system', 0.55, 0.5, 0, 2, 0, 0.4, 8, 'open', Date.now());
+    }
+  } catch { /* 忽略 */ }
+
+  // 能力目录 + 进行中的任务
+  let capLine = '', planLine = '';
+  try {
+    const caps = db.prepare(`SELECT text FROM node WHERE kind='capability' ORDER BY source_ref`).all();
+    if (caps.length) {
+      const names = caps.map((c) => String(c.text).match(/^能力｜([^：]+)/)?.[1]).filter(Boolean);
+      capLine = '\n🧰 会 ' + names.length + ' 项技能：' + names.join('、');
+    }
+    const plans = db.prepare(`SELECT uid, text FROM node WHERE kind='plan' AND status='open' ORDER BY id DESC LIMIT 2`).all();
+    if (plans.length) {
+      const bits = [];
+      for (const p of plans) {
+        const steps = db.prepare(`SELECT text, status FROM node WHERE kind='step' AND source_ref=? ORDER BY id`).all(p.uid);
+        const done = steps.filter((x) => x.status === 'done').length;
+        const cur = steps.find((x) => x.status === 'doing') || steps.find((x) => x.status === 'pending');
+        bits.push(`${String(p.text).replace(/^目标｜/, '').slice(0, 20)}（${done}/${steps.length}，当前：${(cur ? cur.text : '全部完成').replace(/^第\d+步｜/, '').slice(0, 16)}）`);
+      }
+      planLine = '\n📋 进行中：' + bits.join('；');
+    }
+  } catch { /* 忽略 */ }
+
+  // 自主议程：缺口 + 未完成承诺
+  let agendaLine = '';
+  try {
+    const gaps = db.prepare(`SELECT text FROM node WHERE kind='gap' AND (status IS NULL OR status='open')
+      ORDER BY (access_count*0.3 + importance) DESC LIMIT 2`).all();
+    const pros = db.prepare(`SELECT text FROM node WHERE kind='promise' AND (status IS NULL OR status='open')
+      ORDER BY importance DESC LIMIT 1`).all();
+    const bits = [];
+    if (gaps.length) bits.push('🎯 我还不懂：' + gaps.map((g) => String(g.text).replace(/^缺口｜/, '').slice(0, 30)).join('；'));
+    if (pros.length) bits.push('📌 欠着：' + String(pros[0].text).replace(/^承诺｜/, '').slice(0, 30));
+    if (bits.length) agendaLine = '\n' + bits.join('\n');
+  } catch { /* 忽略 */ }
+
+  // 间隔重复：顺带报 1~2 条今天到期的
+  let dueLine = '';
+  try {
+    const dueRows = db.prepare(`SELECT id, text, strength, last_review_at, ts_from FROM node
+      WHERE cold=0 AND pinned=0 ORDER BY (COALESCE(last_review_at, ts_from) + strength*0.693*0.9*86400000) ASC LIMIT 3`).all();
+    const nowMs = Date.now();
+    const expired = dueRows.filter((r) => (r.last_review_at || r.ts_from) + Math.max(0.2, r.strength || 1) * 0.693 * 0.9 * 86400000 <= nowMs);
+    if (expired.length) {
+      dueLine = '\n🔁 到期该复习：' + expired.slice(0, 2).map((r) => String(r.text).slice(0, 30)).join(' / ');
+    }
+  } catch { /* 忽略 */ }
+
+  return { block: lines.join('\n') + capLine + planLine + agendaLine + dueLine, chars, ms: Date.now() - t0, hits: lines.length };
+}
