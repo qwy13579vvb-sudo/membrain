@@ -1,0 +1,46 @@
+# 想开 CI：把本文件复制到 .github/workflows/ci.yml 即可（GitHub 网页上点 Add file 也能加）
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: 建库 · 灌示例 · 检索 · 星图
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 初始化（建库 + 示例 + 副库）
+        run: node scripts/init.mjs
+
+      - name: 检索冒烟
+        run: |
+          out=$(node src/mg.mjs search "记忆")
+          echo "$out" | head -20
+          echo "$out" | grep -q '"hits"' || { echo "检索没有返回 hits"; exit 1; }
+
+      - name: 遗忘曲线 & 复习单元测试
+        run: node scripts/test-core.mjs
+
+      - name: 星图生成
+        run: |
+          node tools/build-star-map.mjs
+          test -s star-map.html || { echo "星图没生成"; exit 1; }
+
+      - name: 全部脚本语法检查
+        run: |
+          fail=0
+          for f in src/*.mjs tools/*.mjs demo/*.mjs scripts/*.mjs plugin/dsh-brain/lib/*.js; do
+            node --check "$f" || { echo "语法错误: $f"; fail=1; }
+          done
+          exit $fail

@@ -1,12 +1,30 @@
 # 🧠 MemBrain · 会遗忘的 AI 长期记忆
 
+### 三条命令，给你自己的 AI 装一个大脑
+
+```bash
+git clone https://github.com/qwy13579vvb-sudo/membrain.git
+cd membrain
+node scripts/init.mjs        # 建库 + 灌示例 + 建索引，一条命令搞定
+```
+
+```bash
+node src/mg.mjs search "记忆"        # 立刻能搜
+node tools/build-star-map.mjs       # 生成星图，双击就能看
+```
+
+**要求：Node.js ≥ 22.5，不需要 npm install，不需要任何 API Key，不需要数据库服务。**
+（接 LLM 做归纳才需要；不接也能跑全部核心功能）
+
+
+> **想开 CI？** 把 `docs/ci-example.yml` 复制到 `.github/workflows/ci.yml` 就会自动跑
+> （建库 → 检索 → 14 条单元测试 → 星图 → 全脚本语法，Node 22 / 24 双版本）。
+> 手动验证也行：`node scripts/test-core.mjs` 应输出 `14 通过 / 0 失败`。
+
+---
+
 **给 AI Agent 的一套长期记忆系统**：四层结构 + 艾宾浩斯遗忘 + 间隔重复 + 记忆巩固 + 替代链 + 证据标注。
 零依赖，只用 Node 内置的 `node:sqlite`；离线可跑；912 条记忆检索 7–30ms。
-
-```
-L1 原始事件  →  L2 日记/周摘要  →  L3 主题  →  L4 人格画像
-      ↑ 每 5 分钟转录          ↑ 归纳                ↑ 全库重写
-```
 
 ---
 
