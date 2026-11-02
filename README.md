@@ -132,6 +132,18 @@ docs/             ARCHITECTURE.md（设计取舍与踩坑）
 
 ---
 
+## 作为一个 DSH 插件（每轮自动回想）
+
+```bash
+git clone https://github.com/qwy13579vvb-sudo/membrain.git
+dsh plugin --profile web add link:./membrain/plugin/dsh-brain
+# 然后重启 DSH
+```
+
+装好后，每轮对话会自动带上：`💭 我想跟你说的` / `🧵 刚才在做` / `🎯 我还不懂` / `📌 欠着` / `🔁 到期该复习`。
+
+---
+
 ## 接入自己的 Agent
 
 **方式一：命令行**

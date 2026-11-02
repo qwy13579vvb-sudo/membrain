@@ -5,6 +5,16 @@
 ## 安装
 
 ```bash
+# 方式一：从已 clone 的仓库链进去（推荐）
+dsh plugin --profile web add link:/path/to/membrain/plugin/dsh-brain
+
+# 方式二：从 GitHub 直接装（如果 dsh 支持 github: 规格）
+dsh plugin --profile web add github:qwy13579vvb-sudo/membrain
+```
+
+装完**重启 DSH** 生效。
+
+```bash
 # 把本目录链进你的 profile（示例：web）
 dsh plugin --profile web add link:/path/to/membrain/plugin/dsh-brain
 ```
